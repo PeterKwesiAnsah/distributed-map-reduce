@@ -177,6 +177,7 @@ func (c *Coordinator) server(sockname string) {
 	if e != nil {
 		log.Fatalf("listen error %s: %v\n", sockname, e)
 	}
+	fmt.Printf("Coordinator: Listening on %s\n", sockname)
 	go http.Serve(l, nil)
 }
 
@@ -223,6 +224,7 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 		totalTasks := mSize
 		phase := c.runningPhase
 		for {
+			fmt.Printf("Scheduler: Phase %d, Total Tasks %d, Completed Tasks %d, Inprogress Tasks %d, Failed Tasks %d\n", phase, totalTasks, compTasks, inprogressTasks, failedTasks)
 			if compTasks == totalTasks && phase == MapTask {
 				//send out reduce tasks
 				phase = ReduceTask
@@ -294,18 +296,19 @@ func (c *Coordinator) workerMonitor() {
 			done := make(chan *rpc.Call, 1)
 			for {
 				timeout := time.After(1 * time.Second)
-				var taskStatus *TaskStatus
-				client.Go("Worker.TaskStatusCheck", worker.taskId, taskStatus, done)
+				taskStatus := new(TaskStatus)
+				client.Go("WorkerTaskState.TaskStatusCheck", worker.taskId, taskStatus, done)
 				select {
 				case <-timeout:
 					workerChannels[scheduler].failed <- worker
 					return
 				case c := <-done:
 					if c.Error != nil {
+						fmt.Printf("Worker Id failed %d: %v\n", worker.info.WorkerId, c.Error)
 						workerChannels[scheduler].failed <- worker
 						return
 					}
-					taskStatus = c.Reply.(*TaskStatus)
+					taskStatus := c.Reply.(*TaskStatus)
 					if *taskStatus {
 						workerChannels[scheduler].completed <- worker
 						return
