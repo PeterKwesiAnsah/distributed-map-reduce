@@ -11,161 +11,235 @@ import (
 	"time"
 )
 
-type workerState int
-type channelType int
-
-const (
-	in_progress workerState = iota
-	completed
-	failed
-)
-
-const (
-	scheduler channelType = iota
-	monitor
-	cdone
-)
-
-type taskStatus struct {
-	//workerId WorkerId
-	state workerState
-	info  WorkerInfo
+type workerKey string
+type workerState struct {
+	sockName string
+	lastSeen time.Time
+	tasks    Tasks
+	alive    bool
 }
 
-// TODO: Read/Write locks for mTasks and rTasks
+type Tasks struct {
+	//non-negative (pending/waiting/non-finished reduceTask), negative idle
+	Current                       int
+	CurrentRPartitionToMapOutDone Bitmap
+	Received                      Bitmap
+	Status                        Bitmap
+}
+
 type Coordinator struct {
-	mTasks       *[][]taskStatus
-	mu           sync.Mutex
-	runningPhase TaskType
-	mOutput      *[][]string
-	rTasks       *[][]taskStatus
-	mu_moutput   sync.Mutex
+	mu               sync.Mutex
+	taskToWorkerKeys *[][]workerKey
+	workerKeyToTasks map[workerKey]workerState
+	scheduled        Bitmap
+	status           Bitmap
+	jobStatus        JobStatus
 }
 
 type workerChannelItem struct {
 	info   WorkerInfo
 	taskId TaskId
 }
-type workerTasks struct {
-	completed chan workerChannelItem
-	pending   chan workerChannelItem
-	failed    chan workerChannelItem
+
+var reduceTasksCnt uint32
+var mapTasksCnt uint32
+var sockName string
+
+func (c *Coordinator) pingWorkers(workers []workerKey) {
+	for _, worker := range workers {
+		go worker.pingWorker(c)
+	}
 }
 
-var reduceTasksCnt int
-var mapTasksCnt int
-var completedRTasks = 0
+func (wt workerKey) pingWorker(c *Coordinator) {
+	client, err := connectrpc(string(wt))
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	timeout := time.After(1 * time.Second)
+	done := make(chan *rpc.Call, 1)
+	tasks := new(Tasks)
+	client.Go("WorkerTaskState.HeartbeatPing", wt, tasks, done)
+	select {
+	case <-timeout:
+		return
+	case t := <-done:
+		tasks := *(t.Reply.(*Tasks))
+		c.mu.Lock()
+		ws := (c.workerKeyToTasks[wt])
+		ws.alive = true
+		ws.lastSeen = time.Now()
+		c.workerKeyToTasks[wt] = ws
+		c.status.Add(tasks.Status)
+		c.mu.Unlock()
+	}
 
-var quitScheduler chan bool
+}
+func (wt *workerState) receievedAnyMapTask() bool {
+	for i := range mapTasksCnt {
+		if wt.tasks.Received.Get(i) {
+			return true
+		}
+	}
+	return false
+}
 
-type channelTasks [3]workerTasks
+func (c *Coordinator) ReportTaskFailed(arg TaskReport, reply *struct{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	bitIndex := uint32(arg.TaskId)
+	if arg.Type == ReduceTask {
+		bitIndex += mapTasksCnt
+	}
+	c.scheduled.Clear(bitIndex)
+	c.status.Clear(bitIndex)
+	return nil
+}
 
-var workerChannels channelTasks
+func (c *Coordinator) GetWorkerConfig(arg WorkerInfo, reply *WorkerConfig) error {
+	*reply = WorkerConfig{
+		MapTasksCount:    mapTasksCnt,
+		ReduceTasksCount: reduceTasksCnt,
+	}
+	return nil
+}
 
 // idle/non-active/nil -> in_progress
 func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
-	schedulerChannel := workerChannels[scheduler]
-	defer c.mu.Unlock()
 	c.mu.Lock()
-	if c.runningPhase == MapTask {
-		mapTasksFiles := os.Args[2:]
-		for mapTaskId, file := range mapTasksFiles {
-			mTask := (*c.mTasks)[mapTaskId]
-			if mTask == nil {
-				(*c.mTasks)[mapTaskId] = []taskStatus{
-					{info: arg, state: in_progress},
-				}
-				*reply = Task{
-					Path:        file,
-					ReduceTasks: (uint32)(reduceTasksCnt),
-					TaskId:      (TaskId)(mapTaskId),
-					Type:        MapTask,
-					Status:      false,
-				}
-				schedulerChannel.pending <- workerChannelItem{info: arg, taskId: (TaskId)(mapTaskId)}
-				return nil
-			} else {
-				lastStatus := mTask[len(mTask)-1]
-				if lastStatus.state == failed {
-					c.markTask(0, (TaskId)(mapTaskId), arg, in_progress)
-					*reply = Task{
-						Path:        file,
-						ReduceTasks: (uint32)(reduceTasksCnt),
-						TaskId:      (TaskId)(mapTaskId),
-						Type:        MapTask,
-						Status:      false,
-					}
-					schedulerChannel.pending <- workerChannelItem{info: arg, taskId: (TaskId)(mapTaskId)}
-					return nil
-				}
-			}
-		}
-		goto HANDLE_ERROR
+	defer c.mu.Unlock()
+	if c.jobStatus {
+		*reply = Task{Type: ExitTask}
+		return nil
+	}
+	c.workerKeyToTasks[workerKey(arg.Sockname)] = workerState{
+		lastSeen: time.Now(),
+		tasks:    arg.Tasks,
+		alive:    true,
+		sockName: arg.Sockname,
 	}
 
-	for reduceTaskId := range reduceTasksCnt {
-		rTask := (*c.rTasks)[reduceTaskId]
-		if rTask == nil {
+	// extract this into a separate func
+	for i := range mapTasksCnt {
+		if !c.scheduled.Get(i) {
+			sockName := os.Args[1]
+			files := os.Args[2:]
+			taskToWorkerKeys := *c.taskToWorkerKeys // (need sep lock)
+			if taskToWorkerKeys[i] == nil {
+				taskToWorkerKeys[i] = []workerKey{workerKey(arg.Sockname)}
+				*reply = Task{
+					TaskId: (TaskId(i)),
+					FileChunks: []Chunk{
+						{Sockname: sockName, Path: files[i], Index: i},
+					},
+					Type: MapTask,
+				}
+				c.scheduled.Set(i)
+				return nil
+			}
+			taskToWorkerKeys[i] = append(taskToWorkerKeys[i], workerKey(arg.Sockname))
 			*reply = Task{
-				MapOutputs: (*c.mOutput)[reduceTaskId],
-				TaskId:     (TaskId)(reduceTaskId),
-				Type:       ReduceTask,
-				Status:     false,
+				TaskId: (TaskId(i)),
+				FileChunks: []Chunk{
+					{Sockname: sockName, Path: files[i], Index: i},
+				},
+				Type: MapTask,
 			}
-			(*c.rTasks)[reduceTaskId] = []taskStatus{{info: arg, state: in_progress}}
-			schedulerChannel.pending <- workerChannelItem{info: arg, taskId: (TaskId)(reduceTaskId)}
+			c.scheduled.Set(i)
 			return nil
-		} else {
-			if rTask[len(rTask)-1].state == failed {
-				c.markTask(1, (TaskId)(reduceTaskId), arg, in_progress)
-				*reply = Task{
-					MapOutputs: (*c.mOutput)[reduceTaskId],
-					TaskId:     (TaskId)(reduceTaskId),
-					Type:       ReduceTask,
-					Status:     false,
-				}
-				schedulerChannel.pending <- workerChannelItem{info: arg, taskId: (TaskId)(reduceTaskId)}
-				return nil
+		}
+	}
+
+	//check for any pending reduceTask
+	if arg.Tasks.Current > 0 {
+		var todoMapOutputs []uint32
+		var chunks []Chunk
+		for i := range mapTasksCnt {
+			if !arg.Tasks.CurrentRPartitionToMapOutDone.Get(i) {
+				todoMapOutputs = append(todoMapOutputs, i)
 			}
 		}
-		goto HANDLE_ERROR
-	}
-HANDLE_ERROR:
-	return fmt.Errorf("All tasks are inprogress or completed\n")
-}
+		//scan workers
+		for _, worker := range c.workerKeyToTasks {
+			if !worker.alive {
+				continue
+			}
+			// recieved any mapTasks??
+			if worker.receievedAnyMapTask() {
+				for _, mapOutput := range todoMapOutputs {
+					// worker alive, received task, processed task
+					if worker.tasks.Received.Get(mapOutput) && worker.tasks.Status.Get(mapOutput) {
+						chunks = append(chunks, Chunk{
+							Index:    mapOutput,
+							Sockname: worker.sockName,
+							Path:     fmt.Sprintf("mr-%d-%d", mapOutput, arg.Tasks.Current),
+						})
+					}
 
-// in_progress -> completed
-func (c *Coordinator) OutputReducePartitions(arg NotifyTaskOutput, reply *NotifyStatus) error {
-	if reduceTasksCnt != len(arg.ReduceTasks) {
-		*reply = -1 //INSUF_RT
-		return fmt.Errorf("Expected %d but got %d\n", reduceTasksCnt, len(arg.ReduceTasks))
-	}
-	*reply = 0
-	defer c.mu_moutput.Unlock()
-	c.mu_moutput.Lock()
-	for index, reduceTask := range arg.ReduceTasks {
-		reduceTasks := (*c.mOutput)[index]
-		if reduceTasks == nil {
-			(*c.mOutput)[index] = make([]string, 0, reduceTasksCnt)
-			reduceTasks = (*c.mOutput)[index]
+				}
+			}
 		}
-		reduceTasks = append(reduceTasks, reduceTask)
-		(*c.mOutput)[index] = reduceTasks
+		if len(chunks) == 0 {
+			*reply = Task{Type: WaitTask}
+			return nil
+		}
+		*reply = Task{
+			TaskId:     TaskId(arg.Tasks.Current),
+			FileChunks: chunks,
+			Type:       ReduceTask,
+		}
+		return nil
 	}
+
+	for reduceTask := range reduceTasksCnt {
+		if !c.scheduled.Get(reduceTask + mapTasksCnt) {
+			var chunks []Chunk
+			//scan workers
+			for _, worker := range c.workerKeyToTasks {
+				if !worker.alive {
+					continue
+				}
+				// recieved any mapTasks??
+				if worker.receievedAnyMapTask() {
+					for mapOutput := range mapTasksCnt {
+						// worker alive, received task, processed task
+						if worker.tasks.Received.Get(mapOutput) && worker.tasks.Status.Get(mapOutput) {
+							chunks = append(chunks, Chunk{
+								Index:    mapOutput,
+								Sockname: worker.sockName,
+								Path:     fmt.Sprintf("mr-%d-%d", mapOutput, reduceTask),
+							})
+						}
+
+					}
+				}
+			}
+			*reply = Task{
+				TaskId:     TaskId(reduceTask),
+				FileChunks: chunks,
+				Type:       ReduceTask,
+			}
+			c.scheduled.Set(reduceTask + mapTasksCnt)
+			return nil
+		}
+	}
+	*reply = Task{Type: WaitTask}
 	return nil
 }
 
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-func (c *Coordinator) Done() bool {
-	ch := workerChannels[cdone].completed
-	if completedRTasks == reduceTasksCnt {
-		quitScheduler <- true
-		return true
+func (c *Coordinator) Done() JobStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range reduceTasksCnt {
+		if !c.status.Get(i + mapTasksCnt) {
+			return false
+		}
 	}
-	<-ch
-	completedRTasks++
-	return false
+	c.jobStatus = true
+	return c.jobStatus
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -188,134 +262,73 @@ func (c *Coordinator) server(sockname string) {
 // TODO: 4.9 (Counters)
 // TODO: implement task locking, remove global lock
 
-func (wt *channelTasks) initializePending(ch channelType) {
-	wt[ch].pending = make(chan workerChannelItem, reduceTasksCnt+mapTasksCnt)
-}
-func (wt *channelTasks) initializeCompleted(ch channelType) {
-	wt[ch].completed = make(chan workerChannelItem, reduceTasksCnt+mapTasksCnt)
-}
-func (wt *channelTasks) initializeFailed(ch channelType) {
-	wt[ch].failed = make(chan workerChannelItem, reduceTasksCnt+mapTasksCnt)
-}
-
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
 
-	M := len(files)
-	reduceTasksCnt = nReduce
+	M := (uint32)(len(files))
+	reduceTasksCnt = (uint32(nReduce))
 	mapTasksCnt = M
 
-	workerChannels.initializeCompleted(cdone)
-	quitScheduler = make(chan bool)
-
-	var mapTasks [][]taskStatus = make([][]taskStatus, M)
-	var mapOutput [][]string = make([][]string, nReduce)
-	var reduceTasks [][]taskStatus = make([][]taskStatus, nReduce)
-	c := Coordinator{mTasks: &mapTasks, rTasks: &reduceTasks, mOutput: &mapOutput, runningPhase: MapTask}
+	var tasks [][]workerKey = make([][]workerKey, M)
+	c := Coordinator{
+		taskToWorkerKeys: &tasks,
+		scheduled:        NewBitmap((mapTasksCnt + reduceTasksCnt)),
+		workerKeyToTasks: make(map[workerKey]workerState),
+	}
 	c.server(sockname)
 
-	go func(mSize int, rSize int) {
-
-		workerChannels.initializeFailed(scheduler)
-		workerChannels.initializePending(scheduler)
-		workerChannels.initializeCompleted(scheduler)
-		compTasks := 0
-		inprogressTasks := 0
-		failedTasks := 0
-		totalTasks := mSize
-		phase := c.runningPhase
-		for {
-			fmt.Printf("Scheduler: Phase %d, Total Tasks %d, Completed Tasks %d, Inprogress Tasks %d, Failed Tasks %d\n", phase, totalTasks, compTasks, inprogressTasks, failedTasks)
-			if compTasks == totalTasks && phase == MapTask {
-				//send out reduce tasks
-				phase = ReduceTask
-				totalTasks = rSize
-				compTasks = 0
-				inprogressTasks = 0
-				failedTasks = 0
-				c.mu.Lock()
-				c.runningPhase = ReduceTask
-				c.mu.Unlock()
-			}
-			select {
-			//receieve task and forward it to interested goroutines based on certain conditions
-			case t := <-workerChannels[scheduler].pending:
-				inprogressTasks++
-				workerChannels[monitor].pending <- t
-			case t := <-workerChannels[scheduler].completed:
-				compTasks++
-				inprogressTasks--
-				if phase == ReduceTask {
-					workerChannels[cdone].completed <- t
+	go func(c *Coordinator) {
+		ticker := time.NewTicker(1 * time.Second)
+		for range ticker.C {
+			//create a slice of socknames
+			var alive []workerKey
+			c.mu.Lock()
+			for k, w := range c.workerKeyToTasks {
+				if !w.alive {
+					continue
 				}
-				c.mu.Lock()
-				c.markTask(t.info.Type, t.taskId, t.info, completed)
-				c.mu.Unlock()
-			case t := <-workerChannels[scheduler].failed:
-				failedTasks++
-				inprogressTasks--
-				c.mu.Lock()
-				c.markTask(t.info.Type, t.taskId, t.info, failed)
-				c.mu.Unlock()
-			case <-quitScheduler:
-				//clean up
-				return
+				alive = append(alive, k)
 			}
+			c.mu.Unlock()
+			go c.pingWorkers(alive)
 		}
-	}(M, nReduce)
+	}(&c)
 
-	go c.workerMonitor()
+	go func(c *Coordinator) {
+		ticker := time.NewTicker(2 * time.Second)
+		for range ticker.C {
+			c.mu.Lock()
+			for k, w := range c.workerKeyToTasks {
+				if w.alive {
+					//continue
+					deadline := 10 * time.Second
+					if time.Since(w.lastSeen) > deadline {
+						ws := (c.workerKeyToTasks[k])
+						ws.alive = false
+						//We are handling only one M piece for a worker. This will change for backup tasks where
+						//multiple workers race to complete an M piece
+						for task := range mapTasksCnt + reduceTasksCnt {
+							if task < mapTasksCnt {
+								if ws.tasks.Received.Get(task) {
+									c.status.Clear(task)
+									c.scheduled.Set(task)
+								}
+							}
+							if task < reduceTasksCnt {
+								if ws.tasks.Received.Get(task+mapTasksCnt) && !ws.tasks.Status.Get(task+mapTasksCnt) {
+									c.status.Clear(task + mapTasksCnt)
+									c.scheduled.Set(task + mapTasksCnt)
+								}
+							}
+
+						}
+						c.workerKeyToTasks[k] = ws
+					}
+				}
+			}
+			c.mu.Unlock()
+		}
+
+	}(&c)
 
 	return &c
-}
-
-func (c *Coordinator) markTask(typ TaskType, taskId TaskId, info WorkerInfo, state workerState) {
-	var tasks *[][]taskStatus
-	if typ == MapTask {
-		tasks = c.mTasks
-	} else {
-		tasks = c.rTasks
-	}
-
-	task := (*tasks)[taskId]
-
-	task = append(task, taskStatus{info: info, state: state})
-	(*tasks)[taskId] = task
-}
-
-func (c *Coordinator) workerMonitor() {
-	workerChannels.initializePending(monitor)
-	for {
-		worker := <-workerChannels[monitor].pending
-		client, err := connectrpc(worker.info.Sockname)
-
-		if err != nil {
-			workerChannels[scheduler].failed <- worker
-			continue
-		}
-		go func(client *rpc.Client, worker workerChannelItem) {
-			done := make(chan *rpc.Call, 1)
-			for {
-				timeout := time.After(1 * time.Second)
-				taskStatus := new(TaskStatus)
-				client.Go("WorkerTaskState.TaskStatusCheck", worker.taskId, taskStatus, done)
-				select {
-				case <-timeout:
-					workerChannels[scheduler].failed <- worker
-					return
-				case c := <-done:
-					if c.Error != nil {
-						fmt.Printf("Worker Id failed %d: %v\n", worker.info.WorkerId, c.Error)
-						workerChannels[scheduler].failed <- worker
-						return
-					}
-					taskStatus := c.Reply.(*TaskStatus)
-					if *taskStatus {
-						workerChannels[scheduler].completed <- worker
-						return
-					}
-				}
-
-			}
-		}(client, worker)
-	}
 }
