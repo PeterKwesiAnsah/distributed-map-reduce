@@ -11,6 +11,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // for sorting by key.
@@ -37,10 +38,15 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 var workerSockName string
-var waitTilDone chan bool
+
+const (
+	maxRetries = 5
+)
 
 type WorkerTaskState struct {
-	task Task
+	tasks        Tasks
+	intermediate []KeyValue
+	config       WorkerConfig
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -55,108 +61,141 @@ func (wts *WorkerTaskState) server(sockname string) {
 	go http.Serve(l, nil)
 }
 
-func (wts *WorkerTaskState) TaskStatusCheck(taskId TaskId, reply *TaskStatus) error {
-	if taskId != wts.task.TaskId {
-		return fmt.Errorf("Expected %d taskId but got %d. Check state on master.\n", wts.task.TaskId, taskId)
-	}
-	if wts.task.Status {
-		waitTilDone <- true
-	}
+func (wts *WorkerTaskState) HeartbeatPing(tasks Tasks, reply *Tasks) error {
+	*reply = wts.tasks
 	return nil
+}
+func (wts *WorkerTaskState) reportTaskFailed(c *rpc.Client, id TaskId, taskType TaskType) {
+	var reply struct{}
+	callrpc(c, "Coordinator.ReportTaskFailed", TaskReport{
+		TaskId: id,
+		Type:   taskType,
+	}, &reply)
 }
 
 // main/mrworker.go calls this function.
 // A reasonable naming convention for intermediate files is mr-X-Y, where X is the Map task number, and Y is the reduce task number.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	waitTilDone = make(chan bool)
 	coordSockName = sockname
 	workerSockName = coordinatorSock()
-	runningPhase := MapTask
-	wts := WorkerTaskState{}
+	//reduce
+	mapOutDoneCount := 0
+
+	wts := WorkerTaskState{tasks: Tasks{
+		Current:                       -1,
+		Received:                      NewBitmap((mapTasksCnt + reduceTasksCnt)),
+		Status:                        NewBitmap((mapTasksCnt + reduceTasksCnt)),
+		CurrentRPartitionToMapOutDone: NewBitmap((mapTasksCnt)),
+	}, intermediate: make([]KeyValue, 0), config: WorkerConfig{
+		ReduceTasksCount: 0,
+		MapTasksCount:    0,
+	}}
+
 	// for heartbeat messages between coordinator and worker
 	func() { wts.server(workerSockName) }()
-	for {
-		fmt.Printf("Starting worker with PID %d\n", os.Getpid())
-		wts.task.Status = false
-		c, err := connectrpc(coordSockName)
-		if err != nil {
-			return
+	retries := 0
+
+CONNECT_COORDINATOR:
+	c, err := connectrpc(coordSockName)
+	if err != nil {
+		if retries < maxRetries {
+			retries++
+			time.Sleep(100 * time.Millisecond)
+			goto CONNECT_COORDINATOR
 		}
+		return
+	}
+	retries = 0
+
+	err = callrpc(c, "Coordinator.GetWorkerConfig", WorkerInfo{
+		Sockname: workerSockName,
+	}, &wts.config)
+
+	defer c.Close()
+
+REQUEST_TASK:
+	for {
+		var task Task
 
 		err = callrpc(c, "Coordinator.GetTask", WorkerInfo{
-			WorkerId: WorkerId(os.Getpid()),
-			Type:     0,
 			Sockname: workerSockName,
-		}, &wts.task)
-		defer c.Close()
+		}, &task)
+
 		if err != nil {
-			fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", wts.task.TaskId, err).Error())
-			continue
+			if retries < maxRetries {
+				retries++
+				time.Sleep(200 * time.Millisecond)
+				goto CONNECT_COORDINATOR
+			}
+			return
 		}
-		runningPhase = wts.task.Type
-		if runningPhase == MapTask {
-			fmt.Printf("Starting worker in map phase with PID %d\n", os.Getpid())
-			file, err := os.Open(wts.task.Path)
+		switch task.Type {
+		case MapTask:
+			file, err := os.Open(task.FileChunks[0].Path)
 			if err != nil {
-				log.Fatalf("cannot open %v\n", wts.task.Path)
+				wts.reportTaskFailed(c, task.TaskId, task.Type)
+				time.Sleep(500 * time.Millisecond)
+				goto REQUEST_TASK
 			}
 			content, err := io.ReadAll(file)
 			if err != nil {
-				log.Fatalf("cannot read %v\n", wts.task.Path)
+				wts.reportTaskFailed(c, task.TaskId, task.Type)
+				time.Sleep(500 * time.Millisecond)
+				goto REQUEST_TASK
 			}
+			//set task received
+			wts.tasks.Received.Set(uint32(task.TaskId))
 			file.Close()
-			kva := mapf(wts.task.Path, string(content))
+			kva := mapf(task.FileChunks[0].Path, string(content))
 
-			fps := make([]*os.File, 0, wts.task.ReduceTasks)
-			mapReduceTasks := make([]string, 0, wts.task.ReduceTasks)
+			fps := make([]*os.File, 0, wts.config.ReduceTasksCount)
+			mapReduceTasks := make([]string, 0, wts.config.ReduceTasksCount)
 
-			for partition := range wts.task.ReduceTasks {
-				writeTo := fmt.Sprintf("mr-%d-%d", wts.task.TaskId, partition)
+			for partition := range wts.config.ReduceTasksCount {
+				writeTo := fmt.Sprintf("mr-%d-%d", task.TaskId, partition)
 				fp, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 				if err != nil {
-					log.Fatalf("cannot open %v\n", writeTo)
+					//report error, reset task state
+					wts.reportTaskFailed(c, task.TaskId, task.Type)
+					wts.tasks.Received.Clear(uint32(task.TaskId))
+					time.Sleep(500 * time.Millisecond)
+					goto REQUEST_TASK
 				}
 				mapReduceTasks = append(mapReduceTasks, writeTo)
 				fps = append(fps, fp)
 			}
 
 			//TODO: use a combiner function --use a flag and compare memory usage and performance metrics with or without it
-
 			for _, kv := range kva {
-				partition := ihash(kv.Key) % (int)(wts.task.ReduceTasks)
-				writeTo := mapReduceTasks[partition]
+				partition := ihash(kv.Key) % (int)(wts.config.ReduceTasksCount)
 				fp := fps[partition]
 				enc := json.NewEncoder(fp)
 				err = enc.Encode(&kv)
 				if err != nil {
-					log.Fatalf("cannot write to buffered Key/Value Pair to %v\n", writeTo)
+					wts.reportTaskFailed(c, task.TaskId, task.Type)
+					wts.tasks.Received.Clear(uint32(task.TaskId))
+					time.Sleep(500 * time.Millisecond)
+					goto REQUEST_TASK
 				}
 			}
-			var reply NotifyStatus
-			err = callrpc(c, "Coordinator.OutputReducePartitions", NotifyTaskOutput{
-				ReduceTasks: mapReduceTasks,
-			}, &reply)
-			if err != nil {
-				fmt.Printf(fmt.Errorf("Worker Id %d: %v\n", wts.task.TaskId, err).Error())
-				continue
-			}
+			wts.tasks.Status.Set(uint32(task.TaskId))
 			go func() {
 				for _, fp := range fps {
 					fp.Close()
 				}
 			}()
-			wts.task.Status = true
-			<-waitTilDone
-
-		} else {
-			intermediate := []KeyValue{}
-			for _, reducerTask := range wts.task.MapOutputs {
-				file, err := os.Open(reducerTask)
+		case ReduceTask:
+			wts.tasks.Current = int(task.TaskId)
+			wts.tasks.Received.Set(uint32(task.TaskId) + wts.config.MapTasksCount)
+			intermediate := wts.intermediate
+			for _, mapOutput := range task.FileChunks {
+				file, err := os.Open(mapOutput.Path)
 				if err != nil {
-					log.Fatal(err)
+					continue
 				}
 				dec := json.NewDecoder(file)
+				file.Close()
 				for {
 					var kv KeyValue
 					if err := dec.Decode(&kv); err != nil {
@@ -164,16 +203,29 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 					}
 					intermediate = append(intermediate, kv)
 				}
-				file.Close()
+
+				wts.tasks.CurrentRPartitionToMapOutDone.Set(mapOutput.Index)
+				mapOutDoneCount++
 			}
+			if mapOutDoneCount != int(wts.config.MapTasksCount) {
+				goto REQUEST_TASK
+			}
+			mapOutDoneCount = 0
 			sort.Sort(ByKey(intermediate))
 			// combiner code
 			i := 0
-			writeTo := fmt.Sprintf("mr-out-%d", wts.task.TaskId)
+			writeTo := fmt.Sprintf("mr-out-%d", task.TaskId)
+			//TODO: temp to "mr-out-%d" atomic rename
 			ofile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
 			if err != nil {
-				log.Fatal("Failed to open file\n")
+				wts.reportTaskFailed(c, task.TaskId, task.Type)
+				wts.tasks.Received.Clear(uint32(task.TaskId) + wts.config.MapTasksCount)
+				wts.tasks.Current = -1
+				wts.tasks.CurrentRPartitionToMapOutDone.Reset()
+				wts.intermediate = make([]KeyValue, 0)
+				time.Sleep(500 * time.Millisecond)
+				goto REQUEST_TASK
 			}
 
 			for i < len(intermediate) {
@@ -187,23 +239,29 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 					values = append(values, intermediate[k].Value)
 				}
 				output := reducef(intermediate[i].Key, values)
-				// rs.counts.Keys++
-				// rs.counts.Values += len(values)
+
 				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 				// this is the correct format for each line of Reduce output.
 				i = j
 			}
+
 			ofile.Close()
-			wts.task.Status = true
-			<-waitTilDone
+			wts.tasks.Status.Set(uint32(wts.tasks.Current) + wts.config.MapTasksCount)
+			wts.tasks.Current = -1
+			wts.tasks.CurrentRPartitionToMapOutDone.Reset()
+		case WaitTask:
+			time.Sleep(200 * time.Millisecond) // short backoff, not 2s — you're just polling for the next free task
+			continue REQUEST_TASK
+		case ExitTask:
+			return
 		}
+
 	}
 }
 
 // send an RPC request to the coordinator, wait for the response.
 func callrpc(c *rpc.Client, rpcname string, arg any, reply any) error {
 	err := c.Call(rpcname, arg, reply)
-	//blocking
 	if err != nil {
 		return err
 	}
