@@ -61,7 +61,7 @@ func (wts *WorkerTaskState) server(sockname string) {
 	go http.Serve(l, nil)
 }
 
-func (wts *WorkerTaskState) HeartbeatPing(tasks Tasks, reply *Tasks) error {
+func (wts *WorkerTaskState) HeartbeatPing(_ Tasks, reply *Tasks) error {
 	*reply = wts.tasks
 	return nil
 }
@@ -82,18 +82,16 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	//reduce
 	mapOutDoneCount := 0
 
-	wts := WorkerTaskState{tasks: Tasks{
-		Current:                       -1,
-		Received:                      NewBitmap((mapTasksCnt + reduceTasksCnt)),
-		Status:                        NewBitmap((mapTasksCnt + reduceTasksCnt)),
-		CurrentRPartitionToMapOutDone: NewBitmap((mapTasksCnt)),
-	}, intermediate: make([]KeyValue, 0), config: WorkerConfig{
-		ReduceTasksCount: 0,
-		MapTasksCount:    0,
-	}}
+	wts := WorkerTaskState{
+		tasks: Tasks{
+			Current: -1,
+		},
+		intermediate: make([]KeyValue, 0),
+		config: WorkerConfig{
+			ReduceTasksCount: 0,
+			MapTasksCount:    0,
+		}}
 
-	// for heartbeat messages between coordinator and worker
-	func() { wts.server(workerSockName) }()
 	retries := 0
 
 CONNECT_COORDINATOR:
@@ -111,6 +109,15 @@ CONNECT_COORDINATOR:
 	err = callrpc(c, "Coordinator.GetWorkerConfig", WorkerInfo{
 		Sockname: workerSockName,
 	}, &wts.config)
+	if err != nil {
+		goto CONNECT_COORDINATOR
+	}
+	wts.tasks.Received = NewBitmap((wts.config.MapTasksCount + wts.config.ReduceTasksCount))
+	wts.tasks.Status = NewBitmap((wts.config.MapTasksCount + wts.config.ReduceTasksCount))
+	wts.tasks.CurrentRPartitionToMapOutDone = NewBitmap((wts.config.MapTasksCount))
+
+	// for heartbeat messages between coordinator and worker
+	func(wts *WorkerTaskState) { wts.server(workerSockName) }(&wts)
 
 	defer c.Close()
 
@@ -120,6 +127,7 @@ REQUEST_TASK:
 
 		err = callrpc(c, "Coordinator.GetTask", WorkerInfo{
 			Sockname: workerSockName,
+			Tasks:    wts.tasks,
 		}, &task)
 
 		if err != nil {
