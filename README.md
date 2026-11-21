@@ -27,9 +27,9 @@ A distributed MapReduce framework in Go, inspired by the MIT 6.5840 / 6.824 MapR
 
 This project implements the classic MapReduce programming model:
 
-* **Map** — each input file is split into chunks; a map task reads one chunk and calls the user's `Map(filename, contents)` function, which emits `[]mr.KeyValue` pairs.
-* **Partition** — intermediate key/value pairs are partitioned by `ihash(key) % nReduce` into per-reduce intermediate files named `mr-X-Y` (map task `X`, reduce partition `Y`).
-* **Reduce** — each reduce task gathers all intermediate files for its partition, sorts by key, and calls the user's `Reduce(key, values)` once per distinct key, writing `mr-out-Y`.
+- **Map** — each input file is split into chunks; a map task reads one chunk and calls the user's `Map(filename, contents)` function, which emits `[]mr.KeyValue` pairs.
+- **Partition** — intermediate key/value pairs are partitioned by `ihash(key) % nReduce` into per-reduce intermediate files named `mr-X-Y` (map task `X`, reduce partition `Y`).
+- **Reduce** — each reduce task gathers all intermediate files for its partition, sorts by key, and calls the user's `Reduce(key, values)` once per distinct key, writing `mr-out-Y`.
 
 The coordinator and workers are separate OS processes. The coordinator exposes an RPC service over a UNIX domain socket (via `net/rpc` + HTTP), and workers poll it for tasks. When all reduce tasks finish, the coordinator marks the job done.
 
@@ -37,12 +37,12 @@ The coordinator and workers are separate OS processes. The coordinator exposes a
 
 ## Features
 
-* **Distributed execution** — one coordinator plus any number of worker processes.
-* **UNIX-socket RPC** — coordinator and workers communicate via `net/rpc` over HTTP on a Unix domain socket.
-* **Fault tolerance** — the coordinator heartbeats workers every second and reassigns map/reduce tasks from workers that fail to respond within 10 seconds.
-* **Plugin architecture** — user Map/Reduce functions are compiled as Go plugins (`.so`) and loaded at runtime by both workers and the sequential runner.
-* **Sequential reference** — `mrsequential.go` runs the whole job in a single process, useful for producing correct output to compare against.
-* **Test harness** — `mr/mr_test.go` + `mr/util.go` automate coordinator/worker startup, output merging, and comparison against the sequential baseline.
+- **Distributed execution** — one coordinator plus any number of worker processes.
+- **UNIX-socket RPC** — coordinator and workers communicate via `net/rpc` over HTTP on a Unix domain socket.
+- **Fault tolerance** — the coordinator heartbeats workers every second and reassigns map/reduce tasks from workers that fail to respond within 10 seconds.
+- **Plugin architecture** — user Map/Reduce functions are compiled as Go plugins (`.so`) and loaded at runtime by both workers and the sequential runner.
+- **Sequential reference** — `mrsequential.go` runs the whole job in a single process, useful for producing correct output to compare against.
+- **Test harness** — `mr/mr_test.go` + `mr/util.go` automate coordinator/worker startup, output merging, and comparison against the sequential baseline.
 
 ---
 
@@ -83,7 +83,7 @@ distributed-map-reduce/
 
 ## Prerequisites
 
-* **Go 1.22.0** or newer (`go version`)
+- **Go 1.22.0** or newer (`go version`)
 
 Plugins are built with `go build -buildmode=plugin`, which on some systems requires CGO to be enabled.
 
@@ -108,7 +108,7 @@ cd ..
 The coordinator takes a socket name followed by the input files:
 
 ```bash
-go run mrcoordinator.go sock123 pg-*.txt &
+go run mrcoordinator.go sock123 pg-*.txt
 ```
 
 It prints `Coordinator: Listening on sock123` and runs until `Done()` returns true.
@@ -118,7 +118,7 @@ It prints `Coordinator: Listening on sock123` and runs until `Done()` returns tr
 In separate terminals, start one or more workers. Each worker takes the plugin path and the socket name:
 
 ```bash
-go run mrworker.go wc.so sock123
+go run mrworker.go plugin_load.go wc.so sock123
 ```
 
 Run this 2–4 times in parallel to see map/reduce tasks distributed across workers.
@@ -202,42 +202,42 @@ go run mrworker.go myapp.so sock123   # repeat for multiple workers
 
 ## Included applications
 
-| Plugin | Description |
-|--------|-------------|
-| `wc.go` | Word count — counts occurrences of each word. |
-| `indexer.go` | Inverted index — each word maps to the documents it appears in. |
-| `crash.go` | Fault injection — randomly crashes or delays (tests recovery). |
+| Plugin          | Description                                                                 |
+| --------------- | --------------------------------------------------------------------------- |
+| `wc.go`         | Word count — counts occurrences of each word.                               |
+| `indexer.go`    | Inverted index — each word maps to the documents it appears in.             |
+| `crash.go`      | Fault injection — randomly crashes or delays (tests recovery).              |
 | `early_exit.go` | Slow reduce on some keys — tests that workers/coordinator don't exit early. |
-| `jobcount.go` | Counts map task invocations — detects duplicate task execution. |
-| `mtiming.go` | Verifies map tasks run in parallel. |
-| `nocrash.go` | Non-crashing variant used by crash tests. |
-| `rtiming.go` | Verifies reduce tasks run in parallel. |
+| `jobcount.go`   | Counts map task invocations — detects duplicate task execution.             |
+| `mtiming.go`    | Verifies map tasks run in parallel.                                         |
+| `nocrash.go`    | Non-crashing variant used by crash tests.                                   |
+| `rtiming.go`    | Verifies reduce tasks run in parallel.                                      |
 
 ---
 
 ## Output file conventions
 
-* **Intermediate files:** `mr-X-Y` — produced by map task `X` for reduce partition `Y`, stored as JSON-encoded `mr.KeyValue` records.
-* **Final output:** `mr-out-Y` — one per reduce task `Y`, each line `<key> <value>`.
-* The sequential runner writes only `mr-out-0`.
-* `.gitignore` ignores `mr-*` and `*.so` to keep build/test artifacts out of version control.
+- **Intermediate files:** `mr-X-Y` — produced by map task `X` for reduce partition `Y`, stored as JSON-encoded `mr.KeyValue` records.
+- **Final output:** `mr-out-Y` — one per reduce task `Y`, each line `<key> <value>`.
+- The sequential runner writes only `mr-out-0`.
+- `.gitignore` ignores `mr-*` and `*.so` to keep build/test artifacts out of version control.
 
 ---
 
 ## Architecture notes
 
-* **Coordinator** (`mr/coordinator.go`)
-  * Serves RPC methods `GetTask`, `GetWorkerConfig`, `ReportTaskFailed`.
-  * Assigns pending map tasks first; reduce tasks start only after all map outputs for their partition are available.
-  * Tracks task state with a `Bitmap` (scheduled / received / completed).
-  * Heartbeats every 1s; workers silent for more than 10s are treated as dead and their in-flight tasks are rescheduled.
-  * `Done()` returns true once every reduce task is complete.
-* **Worker** (`mr/worker.go`)
-  * Exposes its own RPC endpoint (`WorkerTaskState.HeartbeatPing`) so the coordinator can poll it.
-  * Loops: request task → execute (map or reduce) → report completion → repeat until `ExitTask`.
-  * Map writes partitioned intermediate files `mr-X-Y`; reduce reads them, sorts by key, and writes `mr-out-Y`.
-  * Map task assignment uses `ihash(key) % nReduce` for partitioning.
-* **Task types:** `MapTask`, `ReduceTask`, `WaitTask` (no work available yet), `ExitTask` (job finished).
+- **Coordinator** (`mr/coordinator.go`)
+  - Serves RPC methods `GetTask`, `GetWorkerConfig`, `ReportTaskFailed`.
+  - Assigns pending map tasks first; reduce tasks start only after all map outputs for their partition are available.
+  - Tracks task state with a `Bitmap` (scheduled / received / completed).
+  - Heartbeats every 1s; workers silent for more than 10s are treated as dead and their in-flight tasks are rescheduled.
+  - `Done()` returns true once every reduce task is complete.
+- **Worker** (`mr/worker.go`)
+  - Exposes its own RPC endpoint (`WorkerTaskState.HeartbeatPing`) so the coordinator can poll it.
+  - Loops: request task → execute (map or reduce) → report completion → repeat until `ExitTask`.
+  - Map writes partitioned intermediate files `mr-X-Y`; reduce reads them, sorts by key, and writes `mr-out-Y`.
+  - Map task assignment uses `ihash(key) % nReduce` for partitioning.
+- **Task types:** `MapTask`, `ReduceTask`, `WaitTask` (no work available yet), `ExitTask` (job finished).
 
 ---
 
@@ -245,11 +245,11 @@ go run mrworker.go myapp.so sock123   # repeat for multiple workers
 
 The source tree contains the following outstanding items (from `mr/coordinator.go`):
 
-* Backup tasks (speculative execution for stragglers)
-* Ordering guarantees
-* Combiner function (local pre-reduction to reduce network/intermediate data)
-* Status information / counters
-* Per-task locking to replace the global coordinator lock
+- Backup tasks (speculative execution for stragglers)
+- Ordering guarantees
+- Combiner function (local pre-reduction to reduce network/intermediate data)
+- Status information / counters
+- Per-task locking to replace the global coordinator lock
 
 ---
 
