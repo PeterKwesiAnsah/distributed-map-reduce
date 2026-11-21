@@ -47,6 +47,7 @@ var sockName string
 
 func (c *Coordinator) pingWorkers(workers []workerKey) {
 	for _, worker := range workers {
+		log.Printf("Alive Workers ping Worker:%s", worker)
 		go worker.pingWorker(c)
 	}
 }
@@ -54,22 +55,27 @@ func (c *Coordinator) pingWorkers(workers []workerKey) {
 func (wt workerKey) pingWorker(c *Coordinator) {
 	client, err := connectrpc(string(wt))
 	if err != nil {
+		log.Printf("Error RPC connection: %v", err)
 		return
 	}
 	defer client.Close()
 	timeout := time.After(1 * time.Second)
 	done := make(chan *rpc.Call, 1)
 	tasks := new(Tasks)
-	client.Go("WorkerTaskState.HeartbeatPing", wt, tasks, done)
+
+	client.Go("WorkerTaskState.HeartbeatPing", *tasks, tasks, done)
 	select {
 	case <-timeout:
+		log.Printf("RPC function method call WorkerTaskState.HeartbeatPing failed: %v", err)
 		return
 	case t := <-done:
 		tasks := *(t.Reply.(*Tasks))
+		fmt.Printf("Receiving tasks: %v\n", tasks.Received.Len())
 		c.mu.Lock()
 		ws := (c.workerKeyToTasks[wt])
 		ws.alive = true
 		ws.lastSeen = time.Now()
+		ws.tasks = tasks
 		c.workerKeyToTasks[wt] = ws
 		c.status.Add(tasks.Status)
 		c.mu.Unlock()
@@ -152,7 +158,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 	}
 
 	//check for any pending reduceTask
-	if arg.Tasks.Current > 0 {
+	if arg.Tasks.Current >= 0 {
 		var todoMapOutputs []uint32
 		var chunks []Chunk
 		for i := range mapTasksCnt {
@@ -163,6 +169,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 		//scan workers
 		for _, worker := range c.workerKeyToTasks {
 			if !worker.alive {
+				log.Printf("Coordinator: skipping dead worker %s for reduce partition %d", worker.sockName, arg.Tasks.Current)
 				continue
 			}
 			// recieved any mapTasks??
@@ -175,12 +182,14 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 							Sockname: worker.sockName,
 							Path:     fmt.Sprintf("mr-%d-%d", mapOutput, arg.Tasks.Current),
 						})
+						log.Printf("Coordinator: worker %s provided map output %d for reduce partition %d", worker.sockName, mapOutput, arg.Tasks.Current)
 					}
 
 				}
 			}
 		}
 		if len(chunks) == 0 {
+			log.Printf("Coordinator: no map outputs ready for reduce partition %d; assigning WaitTask to %s", arg.Tasks.Current, arg.Sockname)
 			*reply = Task{Type: WaitTask}
 			return nil
 		}
@@ -198,6 +207,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 			//scan workers
 			for _, worker := range c.workerKeyToTasks {
 				if !worker.alive {
+					log.Printf("Coordinator: skipping dead worker %s for reduce task %d", worker.sockName, reduceTask)
 					continue
 				}
 				// recieved any mapTasks??
@@ -210,10 +220,19 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 								Sockname: worker.sockName,
 								Path:     fmt.Sprintf("mr-%d-%d", mapOutput, reduceTask),
 							})
+							log.Printf("Coordinator: worker %s provided map output %d for reduce task %d", worker.sockName, mapOutput, reduceTask)
 						}
 
 					}
 				}
+			}
+			// We did not get a single worker which was alive, nor a single worker that received any map task or the
+			// map workers bare still working
+			if len(chunks) == 0 {
+				// wait until at least one map output is available
+				log.Printf("Coordinator: no map outputs ready for reduce task %d; assigning WaitTask to %s", reduceTask, arg.Sockname)
+				*reply = Task{Type: WaitTask}
+				return nil
 			}
 			*reply = Task{
 				TaskId:     TaskId(reduceTask),
@@ -224,6 +243,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 			return nil
 		}
 	}
+	log.Printf("Coordinator: no tasks available; assigning WaitTask to %s", arg.Sockname)
 	*reply = Task{Type: WaitTask}
 	return nil
 }
@@ -273,6 +293,7 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 		taskToWorkerKeys: &tasks,
 		scheduled:        NewBitmap((mapTasksCnt + reduceTasksCnt)),
 		workerKeyToTasks: make(map[workerKey]workerState),
+		status:           NewBitmap((mapTasksCnt + reduceTasksCnt)),
 	}
 	c.server(sockname)
 
