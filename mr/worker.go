@@ -24,8 +24,8 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
-	Key   string
-	Value string
+	Key   string `json:"Key"`
+	Value string `json:"Value"`
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -197,16 +197,19 @@ REQUEST_TASK:
 			wts.tasks.Current = int(task.TaskId)
 			wts.tasks.Received.Set(uint32(task.TaskId) + wts.config.MapTasksCount)
 			intermediate := wts.intermediate
+			if len(task.FileChunks) == 0 {
+				log.Fatalf("Task FileChunks can't be empty: Reduce task %d\n", task.TaskId)
+			}
 			for _, mapOutput := range task.FileChunks {
 				file, err := os.Open(mapOutput.Path)
 				if err != nil {
 					continue
 				}
 				dec := json.NewDecoder(file)
-				file.Close()
 				for {
 					var kv KeyValue
 					if err := dec.Decode(&kv); err != nil {
+						log.Printf("Failed to decode KV pair from %s error:%v", mapOutput.Path, err)
 						break
 					}
 					intermediate = append(intermediate, kv)
@@ -214,10 +217,15 @@ REQUEST_TASK:
 
 				wts.tasks.CurrentRPartitionToMapOutDone.Set(mapOutput.Index)
 				mapOutDoneCount++
+				file.Close()
 			}
 			if mapOutDoneCount != int(wts.config.MapTasksCount) {
 				goto REQUEST_TASK
 			}
+			if len(intermediate) == 0 {
+				log.Fatalf("Intermediate KV pairs can't be empty: Reduce task %d\n", task.TaskId)
+			}
+			wts.intermediate = intermediate
 			mapOutDoneCount = 0
 			sort.Sort(ByKey(intermediate))
 			// combiner code
@@ -227,6 +235,7 @@ REQUEST_TASK:
 			ofile, err := os.OpenFile(writeTo, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 
 			if err != nil {
+				log.Printf("Failed to open file %s\n", writeTo)
 				wts.reportTaskFailed(c, task.TaskId, task.Type)
 				wts.tasks.Received.Clear(uint32(task.TaskId) + wts.config.MapTasksCount)
 				wts.tasks.Current = -1
@@ -257,6 +266,7 @@ REQUEST_TASK:
 			wts.tasks.Status.Set(uint32(wts.tasks.Current) + wts.config.MapTasksCount)
 			wts.tasks.Current = -1
 			wts.tasks.CurrentRPartitionToMapOutDone.Reset()
+			wts.intermediate = make([]KeyValue, 0)
 		case WaitTask:
 			time.Sleep(200 * time.Millisecond) // short backoff, not 2s — you're just polling for the next free task
 			continue REQUEST_TASK
