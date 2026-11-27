@@ -47,7 +47,7 @@ var sockName string
 
 func (c *Coordinator) pingWorkers(workers []workerKey) {
 	for _, worker := range workers {
-		log.Printf("Alive Workers ping Worker:%s", worker)
+		log.Printf("Alive Workers ping Worker:%s\n", worker)
 		go worker.pingWorker(c)
 	}
 }
@@ -55,7 +55,7 @@ func (c *Coordinator) pingWorkers(workers []workerKey) {
 func (wt workerKey) pingWorker(c *Coordinator) {
 	client, err := connectrpc(string(wt))
 	if err != nil {
-		log.Printf("Error RPC connection: %v", err)
+		log.Printf("Error RPC connection: %v\n", err)
 		return
 	}
 	defer client.Close()
@@ -66,11 +66,10 @@ func (wt workerKey) pingWorker(c *Coordinator) {
 	client.Go("WorkerTaskState.HeartbeatPing", *tasks, tasks, done)
 	select {
 	case <-timeout:
-		log.Printf("RPC function method call WorkerTaskState.HeartbeatPing failed: %v", err)
+		log.Printf("RPC function method call WorkerTaskState.HeartbeatPing failed: %v\n", err)
 		return
 	case t := <-done:
 		tasks := *(t.Reply.(*Tasks))
-		fmt.Printf("Receiving tasks: %v\n", tasks.Received.Len())
 		c.mu.Lock()
 		ws := (c.workerKeyToTasks[wt])
 		ws.alive = true
@@ -159,6 +158,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 
 	//check for any pending reduceTask
 	if arg.Tasks.Current >= 0 {
+		log.Printf("Missing map output files for reduce task %d\n", arg.Tasks.Current)
 		var todoMapOutputs []uint32
 		var chunks []Chunk
 		for i := range mapTasksCnt {
@@ -169,7 +169,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 		//scan workers
 		for _, worker := range c.workerKeyToTasks {
 			if !worker.alive {
-				log.Printf("Coordinator: skipping dead worker %s for reduce partition %d", worker.sockName, arg.Tasks.Current)
+				log.Printf("Coordinator: skipping dead worker %s for reduce partition %d\n", worker.sockName, arg.Tasks.Current)
 				continue
 			}
 			// recieved any mapTasks??
@@ -182,14 +182,14 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 							Sockname: worker.sockName,
 							Path:     fmt.Sprintf("mr-%d-%d", mapOutput, arg.Tasks.Current),
 						})
-						log.Printf("Coordinator: worker %s provided map output %d for reduce partition %d", worker.sockName, mapOutput, arg.Tasks.Current)
+						log.Printf("Coordinator: worker %s provided map output %d for existing reduce partition %d\n", worker.sockName, mapOutput, arg.Tasks.Current)
 					}
 
 				}
 			}
 		}
 		if len(chunks) == 0 {
-			log.Printf("Coordinator: no map outputs ready for reduce partition %d; assigning WaitTask to %s", arg.Tasks.Current, arg.Sockname)
+			log.Printf("Coordinator: no map outputs ready for reduce partition %d; assigning WaitTask to %s\n", arg.Tasks.Current, arg.Sockname)
 			*reply = Task{Type: WaitTask}
 			return nil
 		}
@@ -207,7 +207,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 			//scan workers
 			for _, worker := range c.workerKeyToTasks {
 				if !worker.alive {
-					log.Printf("Coordinator: skipping dead worker %s for reduce task %d", worker.sockName, reduceTask)
+					log.Printf("Coordinator: skipping dead worker %s for reduce task %d\n", worker.sockName, reduceTask)
 					continue
 				}
 				// recieved any mapTasks??
@@ -220,17 +220,17 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 								Sockname: worker.sockName,
 								Path:     fmt.Sprintf("mr-%d-%d", mapOutput, reduceTask),
 							})
-							log.Printf("Coordinator: worker %s provided map output %d for reduce task %d", worker.sockName, mapOutput, reduceTask)
+							log.Printf("Coordinator: worker %s provided map output %d for reduce task %d\n", worker.sockName, mapOutput, reduceTask)
 						}
 
 					}
 				}
 			}
 			// We did not get a single worker which was alive, nor a single worker that received any map task or the
-			// map workers bare still working
+			// map workers are still working
 			if len(chunks) == 0 {
 				// wait until at least one map output is available
-				log.Printf("Coordinator: no map outputs ready for reduce task %d; assigning WaitTask to %s", reduceTask, arg.Sockname)
+				log.Printf("Coordinator: no map outputs ready for reduce task %d; assigning WaitTask to %s\n", reduceTask, arg.Sockname)
 				*reply = Task{Type: WaitTask}
 				return nil
 			}
@@ -243,7 +243,7 @@ func (c *Coordinator) GetTask(arg WorkerInfo, reply *Task) error {
 			return nil
 		}
 	}
-	log.Printf("Coordinator: no tasks available; assigning WaitTask to %s", arg.Sockname)
+	log.Printf("Coordinator: no tasks available; assigning WaitTask to %s\n", arg.Sockname)
 	*reply = Task{Type: WaitTask}
 	return nil
 }
