@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -194,40 +195,44 @@ REQUEST_TASK:
 				}
 			}()
 		case ReduceTask:
+			log.Printf("Starting Reduce Task %d\n", task.TaskId)
 			wts.tasks.Current = int(task.TaskId)
 			wts.tasks.Received.Set(uint32(task.TaskId) + wts.config.MapTasksCount)
-			intermediate := wts.intermediate
+			//intermediate := wts.intermediate
 			if len(task.FileChunks) == 0 {
 				log.Fatalf("Task FileChunks can't be empty: Reduce task %d\n", task.TaskId)
 			}
+
 			for _, mapOutput := range task.FileChunks {
 				file, err := os.Open(mapOutput.Path)
 				if err != nil {
+					log.Printf("Failed to open map output file %s", mapOutput.Path)
 					continue
 				}
 				dec := json.NewDecoder(file)
 				for {
 					var kv KeyValue
 					if err := dec.Decode(&kv); err != nil {
-						log.Printf("Failed to decode KV pair from %s error:%v", mapOutput.Path, err)
+						if !errors.Is(err, io.EOF) {
+							log.Printf("Failed to decode KV pair from %s error:%v\n", mapOutput.Path, err)
+						}
 						break
 					}
-					intermediate = append(intermediate, kv)
+					wts.intermediate = append(wts.intermediate, kv)
 				}
 
 				wts.tasks.CurrentRPartitionToMapOutDone.Set(mapOutput.Index)
 				mapOutDoneCount++
 				file.Close()
 			}
+			//wts.intermediate = intermediate
 			if mapOutDoneCount != int(wts.config.MapTasksCount) {
+				log.Printf("Missing map output files for reduce task %d\n", wts.tasks.Current)
 				goto REQUEST_TASK
 			}
-			if len(intermediate) == 0 {
-				log.Fatalf("Intermediate KV pairs can't be empty: Reduce task %d\n", task.TaskId)
-			}
-			wts.intermediate = intermediate
+
 			mapOutDoneCount = 0
-			sort.Sort(ByKey(intermediate))
+			sort.Sort(ByKey(wts.intermediate))
 			// combiner code
 			i := 0
 			writeTo := fmt.Sprintf("mr-out-%d", task.TaskId)
@@ -244,20 +249,19 @@ REQUEST_TASK:
 				time.Sleep(500 * time.Millisecond)
 				goto REQUEST_TASK
 			}
-
-			for i < len(intermediate) {
+			for i < len(wts.intermediate) {
 				j := i + 1
 				//compares the current and subsequent keys and increment j if they are the same
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				for j < len(wts.intermediate) && wts.intermediate[j].Key == wts.intermediate[i].Key {
 					j++
 				}
 				values := []string{}
 				for k := i; k < j; k++ {
-					values = append(values, intermediate[k].Value)
+					values = append(values, wts.intermediate[k].Value)
 				}
-				output := reducef(intermediate[i].Key, values)
+				output := reducef(wts.intermediate[i].Key, values)
 
-				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+				fmt.Fprintf(ofile, "%v %v\n", wts.intermediate[i].Key, output)
 				// this is the correct format for each line of Reduce output.
 				i = j
 			}
@@ -268,9 +272,11 @@ REQUEST_TASK:
 			wts.tasks.CurrentRPartitionToMapOutDone.Reset()
 			wts.intermediate = make([]KeyValue, 0)
 		case WaitTask:
+			log.Println("Sleep and Wait for a Task")
 			time.Sleep(200 * time.Millisecond) // short backoff, not 2s — you're just polling for the next free task
 			continue REQUEST_TASK
 		case ExitTask:
+			log.Println("Existing...")
 			return
 		}
 
