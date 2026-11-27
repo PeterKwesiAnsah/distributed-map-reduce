@@ -37,6 +37,7 @@ func runMRchan(files []string, app string, n int, c chan int, sock string) {
 	coord := exec.Command("../../mrcoordinator", append([]string{sock}, files...)...)
 	coord.Stderr = os.Stderr
 	coord.Stdout = os.Stdout
+	coord.Dir = tmp
 	if err := coord.Start(); err != nil {
 		log.Fatalf("mr failed %v", err)
 	}
