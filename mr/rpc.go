@@ -7,7 +7,7 @@ const (
 	ExitTask   TaskType = 3
 )
 
-type TaskId uint32
+type TaskId int
 type TaskType uint32
 type Args uint32
 type WorkerId uint32

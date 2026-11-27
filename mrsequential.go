@@ -3,7 +3,7 @@ package main
 //
 // simple sequential MapReduce.
 //
-// go run mrsequential.go wc.so pg*.txt
+// go run mrsequential.go plugin_load.go wc.so pg-*.txt
 //
 
 import (
@@ -89,4 +89,3 @@ func main() {
 
 	ofile.Close()
 }
-
