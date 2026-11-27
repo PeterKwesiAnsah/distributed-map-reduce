@@ -66,17 +66,10 @@ distributed-map-reduce/
 │   ├── rpc.go             # RPC types: Task, TaskType, KeyValue, Chunk, TaskReport, …
 │   ├── bitmap.go          # Bitmap bitset used for task tracking
 │   ├── util.go            # test helpers (runMR, coordinatorSock, mergeOutput, …)
-│   ├── mr_test.go         # integration tests (TestWc enabled, others commented out)
+│   ├── mr_test.go         # integration test (TestWc)
 │   └── mr-tmp-*           # temporary test output directories
 └── mrapps/                # example MapReduce plugins
-    ├── wc.go              # word count
-    ├── indexer.go         # inverted index (word -> docs)
-    ├── crash.go           # randomly crashes / delays (fault injection)
-    ├── early_exit.go      # slow reduce on some keys (early-exit test)
-    ├── jobcount.go        # counts map task invocations
-    ├── mtiming.go         # map timing (parallelism test)
-    ├── nocrash.go         # non-crashing variant
-    └── rtiming.go         # reduce timing (parallelism test)
+    └── wc.go              # word count
 ```
 
 ---
@@ -155,13 +148,13 @@ cmp mr-wc-all.txt mr-wc-seq.txt
 
 ## Running the tests
 
-The framework package includes an integration test (`TestWc`) that starts a coordinator and workers, merges the reduce output, and compares it against the sequential baseline.
+The framework package includes an integration test (`TestWc`) that starts a coordinator and workers, merges the reduce output, and compares it against the sequential baseline:
 
 ```bash
 go test ./mr/ -run TestWc -v
 ```
 
-Other tests (`TestIndexer`, `TestCrashWorker`, `TestEarlyExit`, parallelism tests, etc.) are present in `mr/mr_test.go` but commented out.
+The test builds `wc.so` plus the `mrcoordinator`, `mrworker`, and `mrsequential` binaries automatically, runs `mrsequential` to produce the correct output, runs the distributed MapReduce in parallel, merges the outputs, and uses `cmp` to compare the two.
 
 ---
 
@@ -202,16 +195,9 @@ go run mrworker.go myapp.so sock123   # repeat for multiple workers
 
 ## Included applications
 
-| Plugin          | Description                                                                 |
-| --------------- | --------------------------------------------------------------------------- |
-| `wc.go`         | Word count — counts occurrences of each word.                               |
-| `indexer.go`    | Inverted index — each word maps to the documents it appears in.             |
-| `crash.go`      | Fault injection — randomly crashes or delays (tests recovery).              |
-| `early_exit.go` | Slow reduce on some keys — tests that workers/coordinator don't exit early. |
-| `jobcount.go`   | Counts map task invocations — detects duplicate task execution.             |
-| `mtiming.go`    | Verifies map tasks run in parallel.                                         |
-| `nocrash.go`    | Non-crashing variant used by crash tests.                                   |
-| `rtiming.go`    | Verifies reduce tasks run in parallel.                                      |
+| Plugin | Description |
+| ------ | ----------- |
+| `wc.go` | Word count — counts occurrences of each word. |
 
 ---
 
